@@ -1,81 +1,177 @@
-import * as path from "path";
-import * as sqlite3 from "sqlite3";
-import * as fs from "fs";
-import * as os from "os";
+import {
+  ChatCompletion,
+  ChatCompletionMessageParam,
+  ChatCompletionTool,
+  ChatCompletionToolChoiceOption,
+} from "openai/resources";
+import { AzureOpenAI, OpenAI } from "openai";
 
-import { ChatCompletionRequestMessage, Configuration, OpenAIApi } from "openai";
-
-let _cache_dir: string | null = null;
-
-export function setCacheDir(path: string) {
-  _cache_dir = path;
+export interface CachedLLMParams {
+  /**
+   Model to use for the completion.
+   Note: If using Azure OpenAI, this should be the deployment name..
+   */
+  model: string;
+  messages: ChatCompletionMessageParam[];
+  tools?: ChatCompletionTool[];
+  tool_choice?: ChatCompletionToolChoiceOption;
+  temperature?: number;
+  max_tokens?: number;
+  span_info?: {
+    spanAttributes?: Record<string, string>;
+  };
 }
 
-let _db: sqlite3.Database | null = null;
-async function openCache() {
-  if (_cache_dir === null) {
-    _cache_dir = path.join(os.homedir(), ".cache", "braintrust");
+export interface ChatCache {
+  get(params: CachedLLMParams): Promise<ChatCompletion | null>;
+  set(params: CachedLLMParams, response: ChatCompletion): Promise<void>;
+}
+
+export type OpenAIAuth =
+  | {
+      /** @deprecated Use the `client` option instead */
+      openAiApiKey?: string;
+      /** @deprecated Use the `client` option instead */
+      openAiOrganizationId?: string;
+      /** @deprecated Use the `client` option instead */
+      openAiBaseUrl?: string;
+      /** @deprecated Use the `client` option instead */
+      openAiDefaultHeaders?: Record<string, string>;
+      /** @deprecated Use the `client` option instead */
+      openAiDangerouslyAllowBrowser?: boolean;
+      /** @deprecated Use the `client` option instead */
+      azureOpenAi?: AzureOpenAiAuth;
+      client?: never;
+    }
+  | {
+      client: OpenAI;
+      /** @deprecated Use the `client` option instead */
+      openAiApiKey?: never;
+      /** @deprecated Use the `client` option instead */
+      openAiOrganizationId?: never;
+      /** @deprecated Use the `client` option instead */
+      openAiBaseUrl?: never;
+      /** @deprecated Use the `client` option instead */
+      openAiDefaultHeaders?: never;
+      /** @deprecated Use the `client` option instead */
+      openAiDangerouslyAllowBrowser?: never;
+      /** @deprecated Use the `client` option instead */
+      azureOpenAi?: never;
+    };
+
+export interface AzureOpenAiAuth {
+  apiKey: string;
+  endpoint: string;
+  apiVersion: string;
+}
+
+export function extractOpenAIArgs<T extends Record<string, unknown>>(
+  args: OpenAIAuth & T,
+): OpenAIAuth {
+  return args.client
+    ? { client: args.client }
+    : {
+        openAiApiKey: args.openAiApiKey,
+        openAiOrganizationId: args.openAiOrganizationId,
+        openAiBaseUrl: args.openAiBaseUrl,
+        openAiDefaultHeaders: args.openAiDefaultHeaders,
+        openAiDangerouslyAllowBrowser: args.openAiDangerouslyAllowBrowser,
+        azureOpenAi: args.azureOpenAi,
+      };
+}
+
+const PROXY_URL = "https://api.braintrust.dev/v1/proxy";
+
+const resolveOpenAIClient = (options: OpenAIAuth): OpenAI => {
+  const {
+    openAiApiKey,
+    openAiOrganizationId,
+    openAiBaseUrl,
+    openAiDefaultHeaders,
+    openAiDangerouslyAllowBrowser,
+    azureOpenAi,
+  } = options;
+
+  if (options.client) {
+    return options.client;
   }
 
-  if (_db === null) {
-    fs.mkdirSync(_cache_dir, { recursive: true });
-    const oai_cache = path.join(_cache_dir, "oai.sqlite");
-    _db = new sqlite3.Database(oai_cache);
+  if (globalThis.__client) {
+    return globalThis.__client;
+  }
 
-    await new Promise((resolve, reject) => {
-      _db!.run(
-        "CREATE TABLE IF NOT EXISTS cache (params text, response text)",
-        (err: any) => {
-          if (err) {
-            reject(err);
-          } else {
-            resolve(undefined);
-          }
-        }
-      );
+  if (azureOpenAi) {
+    // if not unset will could raise an exception
+    delete process.env.OPENAI_BASE_URL;
+
+    return new AzureOpenAI({
+      apiKey: azureOpenAi.apiKey,
+      endpoint: azureOpenAi.endpoint,
+      apiVersion: azureOpenAi.apiVersion,
+      defaultHeaders: openAiDefaultHeaders,
+      dangerouslyAllowBrowser: openAiDangerouslyAllowBrowser,
     });
   }
-  return _db!;
-}
 
-let _openai: OpenAIApi | null = null;
-export function openAI() {
-  if (_openai === null && process.env.OPENAI_API_KEY) {
-    const config = new Configuration({ apiKey: process.env.OPENAI_API_KEY });
-    _openai = new OpenAIApi(config);
-  }
-  return _openai;
-}
-
-export async function cachedChatCompletion(args: any) {
-  const db = await openCache();
-
-  const param_key = JSON.stringify(args);
-  const query = `SELECT response FROM "cache" WHERE params=?`;
-  const resp = await new Promise((resolve, reject) => {
-    db.get(query, [param_key], (err, row) => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve(row);
-      }
-    });
+  return new OpenAI({
+    apiKey:
+      openAiApiKey ||
+      process.env.OPENAI_API_KEY ||
+      process.env.BRAINTRUST_API_KEY,
+    organization: openAiOrganizationId,
+    baseURL: openAiBaseUrl || process.env.OPENAI_BASE_URL || PROXY_URL,
+    defaultHeaders: openAiDefaultHeaders,
+    dangerouslyAllowBrowser: openAiDangerouslyAllowBrowser,
   });
-  if (resp) {
-    return JSON.parse((resp as any).response);
+};
+
+const isWrapped = (client: OpenAI): boolean => {
+  const Constructor = Object.getPrototypeOf(client).constructor;
+  const clean = new Constructor({ apiKey: "dummy" });
+  return (
+    String(client.chat.completions.create) !==
+    String(clean.chat.completions.create)
+  );
+};
+
+export function buildOpenAIClient(options: OpenAIAuth): OpenAI {
+  const client = resolveOpenAIClient(options);
+
+  // avoid re-wrapping if the client is already wrapped (proxied)
+  if (globalThis.__inherited_braintrust_wrap_openai && !isWrapped(client)) {
+    return globalThis.__inherited_braintrust_wrap_openai(client);
   }
 
-  const openai = openAI();
-  if (openai === null) {
-    return new Error("OPENAI_API_KEY not set");
-  }
+  return client;
+}
 
-  const completion = await openai.createChatCompletion(args);
-  const data = completion.data;
-  db.run(`INSERT INTO "cache" VALUES (?, ?)`, [
-    param_key,
-    JSON.stringify(data),
-  ]);
+declare global {
+  /* eslint-disable no-var */
+  var __inherited_braintrust_wrap_openai: ((openai: any) => any) | undefined;
+  var __client: OpenAI | undefined;
+}
 
-  return data;
+export const init = ({ client }: { client?: OpenAI } = {}) => {
+  globalThis.__client = client;
+};
+
+export async function cachedChatCompletion(
+  params: CachedLLMParams,
+  options: { cache?: ChatCache } & OpenAIAuth,
+): Promise<ChatCompletion> {
+  const openai = buildOpenAIClient(options);
+
+  const fullParams = globalThis.__inherited_braintrust_wrap_openai
+    ? {
+        ...params,
+        span_info: {
+          spanAttributes: {
+            ...params.span_info?.spanAttributes,
+            purpose: "scorer",
+          },
+        },
+      }
+    : params;
+
+  return await openai.chat.completions.create(fullParams);
 }

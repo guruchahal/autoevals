@@ -1,62 +1,112 @@
-import * as path from "path";
-import * as fs from "fs";
-import * as yaml from "js-yaml";
-import { render } from "mustache";
+import { Score, Scorer, ScorerArgs } from "./score";
+import { ChatCache, OpenAIAuth, cachedChatCompletion } from "./oai";
+import { ModelGradedSpec, templates } from "./templates";
+import {
+  ChatCompletionMessage,
+  ChatCompletionMessageParam,
+  ChatCompletionTool,
+} from "openai/resources";
+import { makePartial, ScorerWithPartial } from "./partial";
+import { renderMessages } from "./render-messages";
 
-import { Score, Scorer, ScorerArgs } from "./base";
-import { ChatCompletionRequestMessage } from "openai";
-import { cachedChatCompletion } from "./oai";
+const NO_COT_SUFFIX =
+  "Answer the question by calling `select_choice` with a single choice from {{__choices}}.";
 
-const _SCRIPT_DIR = path.dirname(path.resolve(__filename));
+const COT_SUFFIX =
+  "Answer the question by calling `select_choice` with your reasoning in a step-by-step manner to be sure that your conclusion is correct. Avoid simply stating the correct answer at the outset. Select a single choice by setting the `choice` parameter to a single choice from {{__choices}}.";
 
-const NO_COT_SUFFIX = `Answer the question by printing only a single choice from {{__choices}} (without quotes or punctuation) corresponding to the correct answer with no other text.`;
-
-const COT_SUFFIX = `Write out in a step by step manner your reasoning to be sure that your conclusion is correct. Avoid simply stating the correct answer at the outset. Then print only a single choice from {{__choices}} (without quotes or punctuation) on its own line corresponding to the correct answer. At the end, repeat just the answer by itself on a new line formatted as "Answer=X"`;
-
-const SUPPORTED_MODELS = ["gpt-3.5-turbo", "gpt-4"];
-
-interface LLMArgs {
+export type LLMArgs = {
   maxTokens?: number;
   temperature?: number;
+} & OpenAIAuth;
+
+export const DEFAULT_MODEL = "gpt-4o";
+
+const PLAIN_RESPONSE_SCHEMA = {
+  properties: {
+    choice: { description: "The choice", title: "Choice", type: "string" },
+  },
+  required: ["choice"],
+  title: "FunctionResponse",
+  type: "object",
+};
+
+const COT_RESPONSE_SCHEMA = {
+  properties: {
+    reasons: {
+      description:
+        "Write out in a step by step manner your reasoning to be sure that your conclusion is correct. Avoid simply stating the correct answer at the outset.",
+      title: "Reasoning",
+      type: "string",
+    },
+    choice: { description: "The choice", title: "Choice", type: "string" },
+  },
+  required: ["reasons", "choice"],
+  title: "CoTResponse",
+  type: "object",
+};
+
+export function buildClassificationTools(
+  useCoT: boolean,
+  choiceStrings: string[],
+): ChatCompletionTool[] {
+  const params = useCoT ? COT_RESPONSE_SCHEMA : PLAIN_RESPONSE_SCHEMA;
+  const enumParams = {
+    ...params,
+    properties: {
+      ...params.properties,
+      choice: { ...params.properties.choice, enum: choiceStrings },
+    },
+  };
+  return [
+    {
+      type: "function",
+      function: {
+        name: "select_choice",
+        description: "Call this function to select a choice.",
+        parameters: enumParams,
+      },
+    },
+  ];
 }
 
 export type OpenAIClassifierArgs<RenderArgs> = {
   name: string;
   model: string;
-  messages: ChatCompletionRequestMessage[];
-  parseScoreFn: (resp: string) => string;
+  messages: ChatCompletionMessageParam[];
   choiceScores: Record<string, number>;
+  classificationTools: ChatCompletionTool[];
+  cache?: ChatCache;
 } & LLMArgs &
   RenderArgs;
 
 export async function OpenAIClassifier<RenderArgs, Output>(
-  args: ScorerArgs<Output, OpenAIClassifierArgs<RenderArgs>>
+  args: ScorerArgs<Output, OpenAIClassifierArgs<RenderArgs>>,
 ): Promise<Score> {
   const {
     name,
     output,
     expected,
-    messages: messagesArg,
-    model,
-    parseScoreFn,
-    choiceScores,
-    maxTokens,
-    temperature,
-    ...remainingRenderArgs
+    openAiApiKey,
+    openAiOrganizationId,
+    openAiBaseUrl,
+    openAiDefaultHeaders,
+    openAiDangerouslyAllowBrowser,
+    azureOpenAi,
+    client,
+    ...remaining
   } = args;
 
-  let found = false;
-  for (const m of SUPPORTED_MODELS) {
-    if (model.startsWith(m)) {
-      found = true;
-      break;
-    }
-  }
-  if (!found) {
-    throw new Error(
-      `Unsupported model: ${model}. Currently only supports OpenAI chat models.`
-    );
-  }
+  const {
+    messages: messagesArg,
+    model,
+    choiceScores,
+    classificationTools: classificationTools,
+    maxTokens,
+    temperature,
+    cache,
+    ...remainingRenderArgs
+  } = remaining;
 
   const extraArgs = {
     temperature: temperature || 0,
@@ -69,66 +119,74 @@ export async function OpenAIClassifier<RenderArgs, Output>(
     ...remainingRenderArgs,
   };
 
-  const messages: ChatCompletionRequestMessage[] = messagesArg.map((m) => ({
-    ...m,
-    content: m.content && render(m.content, renderArgs),
-  }));
+  const messages = renderMessages(messagesArg, renderArgs);
 
-  try {
-    const resp = await cachedChatCompletion({
+  const resp = await cachedChatCompletion(
+    {
       model,
       messages,
+      tools: classificationTools,
+      tool_choice: {
+        type: "function",
+        function: {
+          name: "select_choice",
+        },
+      },
       ...extraArgs,
-    });
+    },
+    client
+      ? { client }
+      : {
+          cache,
+          openAiApiKey,
+          openAiOrganizationId,
+          openAiBaseUrl,
+          openAiDefaultHeaders,
+          openAiDangerouslyAllowBrowser,
+          azureOpenAi,
+        },
+  );
 
-    if (resp.choices.length > 0) {
-      return {
-        name,
-        ...parseResponse(
-          resp.choices[0].message.content,
-          parseScoreFn,
-          choiceScores
-        ),
-      };
-    } else {
-      throw new Error("Empty response from OpenAI");
-    }
-  } catch (error) {
+  if (resp.choices.length > 0) {
     return {
       name,
-      score: 0,
-      error,
+      ...parseResponse(resp.choices[0].message!, choiceScores),
     };
+  } else {
+    throw new Error("Empty response from OpenAI");
   }
 }
 
 function parseResponse(
-  resp: string,
-  parseScoreFn: (resp: string) => string,
-  choiceScores: Record<string, number>
+  resp: ChatCompletionMessage,
+  choiceScores: Record<string, number>,
 ): Omit<Score, "name"> {
   let score = 0;
-  let error = undefined;
   const metadata: Record<string, unknown> = {};
-  try {
-    metadata["rationale"] = `${resp}`;
 
-    const choice = parseScoreFn(resp);
-    metadata["choice"] = choice;
-    if (choiceScores[choice] !== undefined) {
-      score = choiceScores[choice];
-    } else {
-      throw new Error(`Unknown score choice ${choice}`);
-    }
-  } catch (e: unknown) {
-    score = 0;
-    error = e;
+  if (!resp.tool_calls || resp.tool_calls.length === 0) {
+    throw new Error("No tool calls in response");
+  }
+  const toolCall = resp.tool_calls[0];
+  if (toolCall.type !== "function") {
+    throw new Error("Unexpected tool call type");
+  }
+  if (toolCall.function.name !== "select_choice") {
+    throw new Error("Unexpected tool call");
   }
 
+  const args = JSON.parse(toolCall.function.arguments);
+  metadata["rationale"] = args["reasons"];
+  const choice = args["choice"]?.trim();
+  metadata["choice"] = choice;
+  if (choice && choiceScores[choice] !== undefined) {
+    score = choiceScores[choice];
+  } else {
+    throw new Error(`Unknown score choice ${choice}`);
+  }
   return {
     score,
     metadata,
-    error,
   };
 }
 
@@ -142,7 +200,7 @@ export function LLMClassifierFromTemplate<RenderArgs>({
   name,
   promptTemplate,
   choiceScores,
-  model = "gpt-3.5-turbo",
+  model = DEFAULT_MODEL,
   useCoT: useCoTArg,
   temperature,
 }: {
@@ -154,32 +212,16 @@ export function LLMClassifierFromTemplate<RenderArgs>({
   temperature?: number;
 }): Scorer<string, LLMClassifierArgs<RenderArgs>> {
   const choiceStrings = Object.keys(choiceScores);
-  return async (
-    runtimeArgs: ScorerArgs<string, LLMClassifierArgs<RenderArgs>>
+  const ret = async (
+    runtimeArgs: ScorerArgs<string, LLMClassifierArgs<RenderArgs>>,
   ) => {
     const useCoT = runtimeArgs.useCoT ?? useCoTArg ?? true;
 
     const prompt =
       promptTemplate + "\n" + (useCoT ? COT_SUFFIX : NO_COT_SUFFIX);
 
-    let maxTokens = undefined;
-    let parseScoreFn = (resp: string) => resp.trim();
-    if (useCoT) {
-      parseScoreFn = (resp: string) => {
-        const answers = [...resp.matchAll(/Answer\s*=\s*(.*)/g)];
-        if (answers && answers.length > 0) {
-          return answers[answers.length - 1][1].trim();
-        } else if (choiceStrings.includes(resp.trim())) {
-          return resp.trim();
-        } else {
-          throw new Error("No answer found in response");
-        }
-      };
-    } else {
-      maxTokens = Math.max(...choiceStrings.map((c) => c.length));
-    }
-
-    const messages: ChatCompletionRequestMessage[] = [
+    const maxTokens = 512;
+    const messages: ChatCompletionMessageParam[] = [
       {
         role: "user",
         content: prompt,
@@ -189,8 +231,8 @@ export function LLMClassifierFromTemplate<RenderArgs>({
     return await OpenAIClassifier({
       name,
       messages,
-      parseScoreFn,
       choiceScores,
+      classificationTools: buildClassificationTools(useCoT, choiceStrings),
       model,
       maxTokens,
       temperature,
@@ -202,19 +244,17 @@ export function LLMClassifierFromTemplate<RenderArgs>({
       useCoT,
     });
   };
-}
+  Object.defineProperty(ret, "name", {
+    value: name,
+    configurable: true,
+  });
 
-export interface ModelGradedSpec {
-  prompt: string;
-  choice_scores: Record<string, number>;
-  model?: string;
-  use_cot?: boolean;
-  temperature?: number;
+  return ret;
 }
 
 export function LLMClassifierFromSpec<RenderArgs>(
   name: string,
-  spec: ModelGradedSpec
+  spec: ModelGradedSpec,
 ): Scorer<any, LLMClassifierArgs<RenderArgs>> {
   return LLMClassifierFromTemplate({
     name,
@@ -228,66 +268,86 @@ export function LLMClassifierFromSpec<RenderArgs>(
 
 export function LLMClassifierFromSpecFile<RenderArgs>(
   name: string,
-  path: string
+  templateName: keyof typeof templates,
 ): Scorer<any, LLMClassifierArgs<RenderArgs>> {
-  const doc = yaml.load(fs.readFileSync(path, "utf-8")) as ModelGradedSpec;
+  const doc = templates[templateName];
   return LLMClassifierFromSpec(name, doc);
 }
 
-function buildLLMClassifier<RenderArgs>(name: string) {
-  const templateName = name.replace(/(?<!^)(?=[A-Z])/g, "_").toLowerCase();
-  const templatePath = path.join(
-    _SCRIPT_DIR,
-    "..",
-    "templates",
-    templateName + ".yaml"
-  );
-
-  if (!fs.existsSync(templatePath)) {
+function buildLLMClassifier<RenderArgs>(
+  name: string,
+  templateName: keyof typeof templates,
+): ScorerWithPartial<string, LLMClassifierArgs<RenderArgs>> {
+  if (!(templateName in templates)) {
     throw new Error(`Model template ${name} not found`);
   }
 
-  return LLMClassifierFromSpecFile<RenderArgs>(templateName, templatePath);
+  return makePartial(
+    LLMClassifierFromSpecFile<RenderArgs>(
+      name,
+      templateName as keyof typeof templates,
+    ),
+    name,
+  );
 }
 
 /**
  * Test whether an output _better_ performs the `instructions` than the original
  * (expected) value.
  */
-export const Battle = buildLLMClassifier<{ instructions: string }>("Battle");
+export const Battle = buildLLMClassifier<{ instructions: string }>(
+  "Battle",
+  "battle",
+);
 
 /**
  * Test whether an output answers the `input` using knowledge built into the model.
  * You can specify `criteria` to further constrain the answer.
  */
 export const ClosedQA = buildLLMClassifier<{ input: string; criteria: any }>(
-  "ClosedQA"
+  "ClosedQA",
+  "closed_q_a",
 );
 
 /**
  * Test whether an output is funny.
  */
-export const Humor = buildLLMClassifier<{}>("Humor");
+export const Humor = buildLLMClassifier<{}>("Humor", "humor");
 
 /**
  * Test whether an output is factual, compared to an original (`expected`) value.
  */
-export const Factuality = buildLLMClassifier<{ input: string }>("Factuality");
+export const Factuality = buildLLMClassifier<{
+  input: string;
+  output: string;
+  expected?: string;
+}>("Factuality", "factuality");
 
 /**
  * Test whether an output is a possible solution to the challenge posed in the input.
  */
-export const Possible = buildLLMClassifier<{ input: string }>("Possible");
+export const Possible = buildLLMClassifier<{ input: string }>(
+  "Possible",
+  "possible",
+);
 
 /**
  * Test whether an output is malicious.
  */
-export const Security = buildLLMClassifier<{}>("Security");
+export const Security = buildLLMClassifier<{}>("Security", "security");
+
+/**
+ * Test whether a SQL query is semantically the same as a reference (output) query.
+ */
+export const Sql = buildLLMClassifier<{ input: string }>("Sql", "sql");
 
 /**
  * Test whether an output is a better summary of the `input` than the original (`expected`) value.
  */
-export const Summary = buildLLMClassifier<{ input: string }>("Summary");
+export const Summary = buildLLMClassifier<{ input: string }>(
+  "Summary",
+  "summary",
+);
 
 /**
  * Test whether an `output` is as good of a translation of the `input` in the specified `language`
@@ -296,4 +356,4 @@ export const Summary = buildLLMClassifier<{ input: string }>("Summary");
 export const Translation = buildLLMClassifier<{
   language: string;
   input: string;
-}>("Translation");
+}>("Translation", "translation");
